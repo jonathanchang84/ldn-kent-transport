@@ -19,6 +19,7 @@ st.markdown("""
     .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 10px; }
     .leg-block { border-left: 4px solid #1E3A8A; padding-left: 10px; margin-bottom: 10px; margin-top: 5px; }
     .map-container { border-radius: 8px; overflow: hidden; margin-bottom: 15px; }
+    .time-badge { background-color: #1E3A8A; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.85rem; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -29,6 +30,20 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 TFL_KEY = st.secrets["TFL_API_KEY"]
+
+# --- HELPER PARSER FOR LIVE TIMESTAMPS ---
+def format_iso_time(iso_str):
+    """Parses TfL ISO timestamps into a clean HH:MM format string."""
+    if not iso_str:
+        return "--:--"
+    try:
+        # Handle optional 'Z' suffix or explicit timezones cleanly
+        clean_str = iso_str.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(clean_str)
+        # Display local time hours and minutes
+        return dt.strftime("%H:%M")
+    except:
+        return "--:--"
 
 # --- USER SESSION & AUTHENTICATION HANDLING ---
 if "user" not in st.session_state:
@@ -201,10 +216,9 @@ if menu == "Watchlist":
                     st.markdown(f"🚩 **{jrny['journey_alias']}**")
                     st.caption(f"{jrny['start_point']} ➡️ {jrny['end_point']}")
                 with col2:
-                    # Swaps the direction directly in your database for instant clean sync
                     if st.button("🔄 Swap", key=f"swap_db_{jrny['id']}", use_container_width=True):
                         swap_saved_journey(jrny['id'], jrny['end_point'], jrny['start_point'])
-                        st.toast("Directions reversed in dashboard!")
+                        st.toast("Directions reversed!")
                         st.rerun()
                 with col3:
                     if st.button("🗑️ Clear", key=f"del_jrny_{jrny['id']}", use_container_width=True):
@@ -217,6 +231,11 @@ if menu == "Watchlist":
                 
                 if check and 'journeys' in check:
                     top_j = check['journeys'][0]
+                    
+                    # Core Live Timing Integration For Main Summary Header
+                    start_time = format_iso_time(top_j.get("departureTime"))
+                    end_time = format_iso_time(top_j.get("arrivalTime"))
+                    
                     window_disruption = False
                     for leg in top_j.get('legs', []):
                         for d in leg.get('disruptions', []):
@@ -225,18 +244,31 @@ if menu == "Watchlist":
                                 break
                     
                     if window_disruption: 
-                        st.error(f"⚠️ Service Alert: Disruption within window detected.")
+                        st.error(f"⚠️ Service Alert | Live: **{start_time}** ➡️ **{end_time}** ({top_j.get('duration')}m)")
                     else: 
-                        st.success(f"✅ Route Clear ({top_j.get('duration')}m).")
+                        st.success(f"✅ Route Clear | Live: **{start_time}** ➡️ **{end_time}** ({top_j.get('duration')}m)")
                     
-                    # Direct inline access to step-by-step instructions without altering tab memory
+                    # Detailed Sub-Leg Schedule Information Dropdown
                     with st.expander("📋 View Live Options & Step-by-Step Instructions"):
                         for idx, alternate in enumerate(check['journeys'][:2]):
+                            alt_start = format_iso_time(alternate.get("departureTime"))
+                            alt_end = format_iso_time(alternate.get("arrivalTime"))
+                            
                             st.markdown(f"**Alternative {idx+1} ({alternate.get('duration')} mins)**")
+                            st.caption(f"🕒 Departs: **{alt_start}** | Arrives: **{alt_end}**")
+                            
                             for leg in alternate.get('legs', []):
-                                st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
+                                leg_start = format_iso_time(leg.get("departureTime"))
+                                leg_end = format_iso_time(leg.get("arrivalTime"))
                                 
-                                # Calling point nodes listing
+                                st.markdown(
+                                    f'<div class="leg-block">'
+                                    f'<strong>{leg.get("instruction", {}).get("summary")}</strong><br/>'
+                                    f'<span style="font-size:0.85rem; color:#555;">⏱️ {leg_start} ➡️ {leg_end} ({leg.get("duration")} mins)</span>'
+                                    f'</div>', 
+                                    unsafe_allow_html=True
+                                )
+                                
                                 if 'path' in leg and 'stopPoints' in leg['path'] and leg['path']['stopPoints']:
                                     stops_list = [pt.get('name') for pt in leg['path']['stopPoints']]
                                     st.caption(f"📍 *Stops:* {', '.join(stops_list)}")
@@ -244,8 +276,6 @@ if menu == "Watchlist":
                                 st.markdown("---")
                 else:
                     st.warning("Could not gather status updates for this layout sequence.")
-    else:
-        st.info("No saved journeys found. Use the 'Route Planner' tab to add your frequent routes.")
 
     # C. Saved Kent Hubs
     saved_locs = get_saved_locations(USER_ID)
@@ -314,10 +344,25 @@ elif menu == "Route Planner":
                     st.rerun()
             
             for idx, journey in enumerate(journey_data['journeys'][:2]):
+                plan_start = format_iso_time(journey.get("departureTime"))
+                plan_end = format_iso_time(journey.get("arrivalTime"))
+                
                 with st.container(border=True):
                     st.markdown(f"**Alternative {idx+1} ({journey.get('duration')} mins)**")
+                    st.caption(f"🕒 Live Window: **{plan_start}** ➡️ **{plan_end}**")
+                    
                     for leg in journey.get('legs', []):
-                        st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
+                        leg_s = format_iso_time(leg.get("departureTime"))
+                        leg_e = format_iso_time(leg.get("arrivalTime"))
+                        
+                        st.markdown(
+                            f'<div class="leg-block">'
+                            f'<strong>{leg.get("instruction", {}).get("summary")}</strong><br/>'
+                            f'<span style="font-size:0.85rem; color:#555;">⏱️ {leg_s} ➡️ {leg_e} ({leg.get("duration")}m)</span>'
+                            f'</div>', 
+                            unsafe_allow_html=True
+                        )
+                        
                         if 'path' in leg and 'stopPoints' in leg['path'] and leg['path']['stopPoints']:
                             with st.expander(f"📋 View stops ({len(leg['path']['stopPoints'])} calling points)"):
                                 for pt in leg['path']['stopPoints']:
