@@ -16,6 +16,7 @@ st.markdown("""
     .block-container { padding-top: 1.5rem; padding-bottom: 1.5rem; }
     .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 10px; }
     div[data-testid="stNotification"] { padding: 0.5rem; }
+    .leg-block { border-left: 4px solid #1E3A8A; padding-left: 10px; margin-bottom: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -60,7 +61,7 @@ def get_kent_bus_arrivals(stop_id):
     """Fetches live regional Kent bus arrivals using public NaPTAN data gateway feeds."""
     url = f"https://transportapi.com/v3/uk/bus/stop/{stop_id}/live.json"
     params = {
-        "app_id": "c62fdfbf",  # Public sandbox prototyping keys
+        "app_id": "c62fdfbf",
         "app_key": "9cfcb68c67a3f3b970878516ee70a0e9",
         "group": "no"
     }
@@ -92,6 +93,23 @@ def search_uk_bus_stops(query_string):
         pass
     return []
 
+@st.cache_data(ttl=60)
+def plan_journey(start, end):
+    """Plans a multi-modal journey using the TfL Cross-Border Journey API."""
+    url = f"https://api.tfl.gov.uk/Journey/JourneyResults/{start}/to/{end}"
+    params = {
+        "app_key": TFL_KEY,
+        "nationalSearch": "true",  # Forces inclusion of Kent National Rail/Buses
+        "timeIs": "departing"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=12)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None
+
 # --- DATABASE PERSISTENCE UTILITIES ---
 def get_saved_routes(user_id):
     res = supabase.table("saved_routes").select("*").eq("user_id", user_id).execute()
@@ -122,7 +140,7 @@ st.caption("Unified live dashboard for cross-border commuters.")
 
 menu = st.segmented_control(
     "Navigate", 
-    options=["Watchlist", "London Lines", "Kent Live Hubs", "Manage Watchlist"], 
+    options=["Watchlist", "Route Planner", "London Lines", "Kent Live Hubs", "Manage Watchlist"], 
     default="Watchlist",
     label_visibility="collapsed"
 )
@@ -135,7 +153,6 @@ line_status_map = {line['name']: line['lineStatuses'][0]['statusSeverityDescript
 if menu == "Watchlist":
     st.subheader("Your Commute Alerts")
     
-    # 1. Saved London Lines
     saved_lines = get_saved_routes(USER_ID)
     if saved_lines:
         st.markdown("#### London Lines")
@@ -146,10 +163,8 @@ if menu == "Watchlist":
             else:
                 st.warning(f"⚠️ **{line} Line**: {status}")
 
-    # 2. Saved Kent Hubs (Trains & Buses)
     saved_locs = get_saved_locations(USER_ID)
     if saved_locs:
-        # Filter and display trains
         train_hubs = [l for l in saved_locs if l['transport_mode'] == "National Rail"]
         if train_hubs:
             st.markdown("#### Kent Train Stations")
@@ -169,7 +184,6 @@ if menu == "Watchlist":
                     else:
                         st.caption("No upcoming trains or data feed unavailable.")
 
-        # Filter and display buses
         bus_hubs = [l for l in saved_locs if l['transport_mode'] == "Bus"]
         if bus_hubs:
             st.markdown("#### Kent Bus Hubs")
@@ -197,7 +211,63 @@ if menu == "Watchlist":
     if not saved_lines and not saved_locs:
         st.info("Your watchlist is empty. Head to 'Manage Watchlist' to customize your feeds.")
 
-# --- VIEW 2: LONDON LINES ---
+# --- VIEW 2: ROUTE PLANNER ---
+elif menu == "Route Planner":
+    st.subheader("📍 Cross-Border Route Planner")
+    st.caption("Plan options using postcodes, station names, or street addresses.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        start_point = st.text_input("From (Postcode / Address):", placeholder="e.g., DA1 1DR")
+    with col2:
+        end_point = st.text_input("To (Postcode / Address):", placeholder="e.g., EC4N 6JD")
+        
+    if st.button("Find Routes", use_container_width=True):
+        if not start_point or not end_point:
+            st.error("Please fill in both a starting point and destination.")
+        else:
+            with st.spinner("Calculating optimal transit legs..."):
+                journey_data = plan_journey(start_point, end_point)
+                
+            if journey_data and 'journeys' in journey_data:
+                st.success(f"Found {len(journey_data['journeys'])} viable route options:")
+                
+                for idx, journey in enumerate(journey_data['journeys'][:3]): # Top 3 itineraries
+                    duration = journey.get('duration')
+                    start_time = journey.get('startDateTime','').split('T')[-1][:5]
+                    arrival_time = journey.get('arrivalDateTime','').split('T')[-1][:5]
+                    
+                    with st.expander(f"Option {idx+1}: {start_time} ➡️ {arrival_time} ({duration} mins)"):
+                        # Check for global route issues/disruptions
+                        has_disruptions = False
+                        
+                        st.markdown("#### 🗺️ Journey Steps")
+                        for leg in journey.get('legs', []):
+                            instruction = leg.get('instruction', {}).get('summary', 'Travel leg')
+                            mode = leg.get('mode', {}).get('name', 'transit')
+                            leg_duration = leg.get('duration')
+                            
+                            # Gather leg anomalies/issues
+                            disruptions = leg.get('disruptions', [])
+                            
+                            st.markdown(f"""
+                            <div class="leg-block">
+                                <strong>{instruction}</strong> ({mode.title()})<br>
+                                <span style="font-size:0.85rem; color:gray;">Duration: {leg_duration} mins</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            if disruptions:
+                                has_disruptions = True
+                                for d in disruptions:
+                                    st.error(f"⚠️ **Issue Alert**: {d.get('description')}")
+                                    
+                        if not has_disruptions:
+                            st.caption("✅ No recorded line delays or service disruptions on this option.")
+            else:
+                st.warning("No routes found. Ensure names or postcodes are typed accurately.")
+
+# --- VIEW 3: LONDON LINES ---
 elif menu == "London Lines":
     st.subheader("All London Services")
     search_query = st.text_input("🔍 Filter Lines (e.g., Central, Victoria)", "").lower()
@@ -213,7 +283,7 @@ elif menu == "London Lines":
                 if status == "Good Service": st.caption("✅ Good Service")
                 else: st.caption(f"🚨 {status}")
 
-# --- VIEW 3: KENT LIVE HUBS ---
+# --- VIEW 4: KENT LIVE HUBS ---
 elif menu == "Kent Live Hubs":
     st.subheader("Live Regional Explorer")
     mode_tab = st.radio("Select Hub Category:", ["Trains", "Buses"], horizontal=True, label_visibility="collapsed")
@@ -267,11 +337,10 @@ elif menu == "Kent Live Hubs":
         else:
             st.info("You haven't saved any bus stops yet. Use the 'Manage Watchlist' search to save your local loops.")
 
-# --- VIEW 4: MANAGE WATCHLIST (Dynamic API Search Engine) ---
+# --- VIEW 5: MANAGE WATCHLIST ---
 elif menu == "Manage Watchlist":
     st.subheader("Edit Watchlist Preferences")
     
-    # 1. Manage London Lines
     st.markdown("### 🚇 London Lines")
     current_saved_lines = get_saved_routes(USER_ID)
     available_lines = sorted(list(line_status_map.keys()))
@@ -287,22 +356,16 @@ elif menu == "Manage Watchlist":
 
     st.markdown("---")
 
-    # 2. Dynamic Kent Transit Hub Search Engine (Trains & Buses)
     st.markdown("### 🔍 Search & Add Kent Hubs")
-    st.caption("Type any station name, street name, or town in Kent to find and track its live boards.")
-    
     search_term = st.text_input("Enter search query (e.g., 'Sevenoaks', 'London Road', 'Dartford'):", value="")
     
     if search_term:
-        # A. National Rail Stations Search Preset Mapping
         kent_train_options = {
             "Sevenoaks": "SEV", "Ashford International": "AFK", "Tunbridge Wells": "TBW",
             "Canterbury West": "CBW", "Chatham": "CTM", "Dartford": "DFD", "Maidstone East": "MDE"
         }
         
-        # Filter trains locally by search term
         matched_trains = {k: v for k, v in kent_train_options.items() if search_term.lower() in k.lower()}
-        
         if matched_trains:
             st.markdown("**Matched Train Stations:**")
             for name, crs in matched_trains.items():
@@ -314,15 +377,14 @@ elif menu == "Manage Watchlist":
                         st.success(f"Added {name} to Watchlist!")
                         st.rerun()
 
-        # B. Live API Bus Stop Endpoint Fetching
         with st.spinner("Searching nationwide bus stops via API..."):
             found_bus_stops = search_uk_bus_stops(search_term)
             
         if found_bus_stops:
             st.markdown("**Matched Regional Bus Stops:**")
-            for stop in found_bus_stops[:8]:  # Limit top 8 matches for mobile view clarity
+            for stop in found_bus_stops[:8]:
                 stop_name = stop.get('name', 'Unknown Stop')
-                indicator = stop.get('indicator', '')  # e.g., "Stop A" or "opp"
+                indicator = stop.get('indicator', '')
                 description = f"{stop_name} ({indicator})" if indicator else stop_name
                 atco_code = stop.get('atcocode')
                 locality = stop.get('locality', 'Kent')
@@ -336,13 +398,9 @@ elif menu == "Manage Watchlist":
                         add_saved_location(USER_ID, description, atco_code, "Bus")
                         st.success(f"Saved {stop_name} to your Watchlist!")
                         st.rerun()
-        
-        if not matched_trains and not found_bus_stops:
-            st.info("No matching transit hubs found. Try refining your spelling.")
 
     st.markdown("---")
 
-    # 3. View Current Saved Hubs & Allow Deletions
     st.markdown("### 🗑️ Current Saved Hubs")
     current_saved_locs = get_saved_locations(USER_ID)
     
