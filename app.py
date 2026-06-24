@@ -61,7 +61,6 @@ USER_EMAIL = st.session_state.user.get("email") if isinstance(st.session_state.u
 # --- API CORE DATA FETCHERS ---
 @st.cache_data(ttl=60)
 def get_transit_line_statuses():
-    """Fetches real-time status for London lines plus Southeastern and Thameslink."""
     modes = "tube,overground,elizabeth-line,dlr,national-rail"
     url = f"https://api.tfl.gov.uk/Line/Mode/{modes}/Status?app_key={TFL_KEY}"
     try:
@@ -116,25 +115,17 @@ def plan_journey(start, end):
     except: pass
     return None
 
-# --- HELPER: EVALUATE 3-HOUR DISRUPTION WINDOW ---
 def is_disruption_within_window(disruption):
-    """Checks if a disruption falls within +/- 3 hours of the current moment."""
     now = datetime.now(timezone.utc)
     three_hours = timedelta(hours=3)
-    
     periods = disruption.get('validityPeriods', [])
-    if not periods:
-        return True
-        
+    if not periods: return True
     for period in periods:
         try:
             from_dt = datetime.fromisoformat(period.get('fromDate').replace('Z', '+00:00'))
             to_dt = datetime.fromisoformat(period.get('toDate').replace('Z', '+00:00'))
-            
-            if (from_dt - three_hours) <= now <= (to_dt + three_hours):
-                return True
-        except:
-            continue
+            if (from_dt - three_hours) <= now <= (to_dt + three_hours): return True
+        except: continue
     return False
 
 # --- DATABASE PERSISTENCE UTILITIES ---
@@ -169,7 +160,7 @@ def remove_saved_journey(journey_id):
     supabase.table("saved_journeys").delete().eq("id", journey_id).execute()
 
 
-# --- MOBILE APPLICATION UI LAYOUT ---
+# --- APPLICATION UI LAYOUT ---
 st.markdown(f"#### 🚇 Cross-Border Engine (`{USER_EMAIL}`)")
 
 menu = st.segmented_control(
@@ -184,9 +175,9 @@ line_status_map = {line['name']: line['lineStatuses'][0]['statusSeverityDescript
 
 # --- VIEW 1: WATCHLIST ---
 if menu == "Watchlist":
-    st.subheader("Your Commute Alerts")
+    st.subheader("Your Commute Dashboard")
     
-    # A. Tracked Line Statuses
+    # A. Tracked Network Line Health Flags
     saved_lines = get_saved_routes(USER_ID)
     if saved_lines:
         st.markdown("#### Tracked Line Statuses")
@@ -195,13 +186,13 @@ if menu == "Watchlist":
             if status == "Good Service": st.success(f"**{line}**: Good Service")
             else: st.warning(f"⚠️ **{line}**: {status}")
 
-    # B. Saved A-to-B Planned Journeys (FIXED LOOKUP LOGIC)
+    # B. Saved A-to-B Planned Journeys Section
     saved_trips = get_saved_journeys(USER_ID)
     if saved_trips:
         st.markdown("#### Bookmarked Trips")
         for jrny in saved_trips:
             with st.container(border=True):
-                col1, col2 = st.columns([0.7, 0.3])
+                col1, col2, col3 = st.columns([0.5, 0.25, 0.25])
                 with col1:
                     st.markdown(f"🚩 **{jrny['journey_alias']}**")
                     st.caption(f"{jrny['start_point']} ➡️ {jrny['end_point']}")
@@ -211,21 +202,26 @@ if menu == "Watchlist":
                         st.session_state.planned_end = jrny['start_point']
                         st.toast("Directions reversed!")
                         st.rerun()
+                with col3:
+                    if st.button("🗑️ Clear", key=f"del_jrny_{jrny['id']}", use_container_width=True):
+                        remove_saved_journey(jrny['id'])
+                        st.toast("Journey deleted")
+                        st.rerun()
                         
-                with st.spinner("Analyzing saved path tracking..."):
+                with st.spinner("Analyzing pipeline..."):
                     check = plan_journey(jrny['start_point'], jrny['end_point'])
                 if check and 'journeys' in check:
                     top_j = check['journeys'][0]
-                    
                     window_disruption = False
                     for leg in top_j.get('legs', []):
                         for d in leg.get('disruptions', []):
                             if is_disruption_within_window(d):
                                 window_disruption = True
                                 break
-                    
                     if window_disruption: st.error(f"⚠️ Service Alert: Disruption within +/- 3hr window detected on this route.")
                     else: st.success(f"✅ Route Clear ({top_j.get('duration')}m).")
+    else:
+        st.info("No saved journeys found. Use the 'Route Planner' tab to add your frequent routes.")
 
     # C. Saved Kent Hubs
     saved_locs = get_saved_locations(USER_ID)
@@ -240,7 +236,7 @@ if menu == "Watchlist":
                     if board and board.get('trainServices'):
                         for train in board['trainServices'][:3]:
                             st.caption(f"**{train.get('std')}** to {train['destination'][0]['locationName']} — {train.get('etd')}")
-                    else: st.caption("No active running train connections tracked.")
+                    else: st.caption("No connections running currently.")
 
         bus_hubs = [l for l in saved_locs if l['transport_mode'] == "Bus"]
         if bus_hubs:
@@ -255,7 +251,7 @@ if menu == "Watchlist":
                         all_buses = sorted(all_buses, key=lambda x: x.get('best_departure_estimate', '23:59'))[:3]
                         for bus in all_buses:
                             st.caption(f"**{bus.get('line')}** to {bus.get('direction')} — **{bus.get('best_departure_estimate')}**")
-                    else: st.caption("No live bus tracker connection available.")
+                    else: st.caption("Live tracker unavailable.")
 
 # --- VIEW 2: ROUTE PLANNER ---
 elif menu == "Route Planner":
@@ -285,7 +281,7 @@ elif menu == "Route Planner":
                     alias_input = st.text_input("Name route:", value="Daily Commute")
                     if st.button("Save to Dashboard", use_container_width=True):
                         add_saved_journey(USER_ID, start_point, end_point, alias_input)
-                        st.success("Trip bookmarked successfully!")
+                        st.success("Trip added to Watchlist dashboard!")
                         st.rerun()
                 
                 for idx, journey in enumerate(journey_data['journeys'][:2]):
