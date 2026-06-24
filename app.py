@@ -60,7 +60,7 @@ def get_kent_bus_arrivals(stop_id):
     """Fetches live regional Kent bus arrivals using public NaPTAN data gateway feeds."""
     url = f"https://transportapi.com/v3/uk/bus/stop/{stop_id}/live.json"
     params = {
-        "app_id": "c62fdfbf",  # Public sandbox prototyping application ID
+        "app_id": "c62fdfbf",  # Public sandbox prototyping keys
         "app_key": "9cfcb68c67a3f3b970878516ee70a0e9",
         "group": "no"
     }
@@ -71,6 +71,26 @@ def get_kent_bus_arrivals(stop_id):
     except Exception:
         pass
     return None
+
+@st.cache_data(ttl=3600)
+def search_uk_bus_stops(query_string):
+    """Searches the entire UK NaPTAN database for matching bus stops via API."""
+    if len(query_string) < 3:
+        return []
+    url = "https://transportapi.com/v3/uk/places.json"
+    params = {
+        "app_id": "c62fdfbf",
+        "app_key": "9cfcb68c67a3f3b970878516ee70a0e9",
+        "query": query_string,
+        "type": "bus_stop"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            return response.json().get('member', [])
+    except Exception:
+        pass
+    return []
 
 # --- DATABASE PERSISTENCE UTILITIES ---
 def get_saved_routes(user_id):
@@ -220,90 +240,123 @@ elif menu == "Kent Live Hubs":
             st.info("No active departures reported at this platform.")
 
     elif mode_tab == "Buses":
-        kent_buses = {
-            "Sevenoaks Bus Station (Bay A)": "2400A041320A",
-            "Dartford Home Gardens (Stop K)": "2400A001090A",
-            "Ashford International Bus Interchange": "2400A052040A"
-        }
-        selected_bus = st.selectbox("Select Bus Interchange:", options=list(kent_buses.keys()))
-        bus_data = get_kent_bus_arrivals(kent_buses[selected_bus])
+        st.caption("Search for specific stops in 'Manage Watchlist' to view countdowns here.")
+        current_saved_locs = get_saved_locations(USER_ID)
+        saved_buses = {l['location_name']: l['stop_id'] for l in current_saved_locs if l['transport_mode'] == "Bus"}
         
-        if bus_data and 'departures' in bus_data:
-            st.markdown(f"### Live countdown for {selected_bus}")
-            all_buses = []
-            for line_no, lists in bus_data['departures'].items():
-                all_buses.extend(lists)
-            all_buses = sorted(all_buses, key=lambda x: x.get('best_departure_estimate', '23:59'))
+        if saved_buses:
+            selected_bus = st.selectbox("Select Bus Interchange:", options=list(saved_buses.keys()))
+            bus_data = get_kent_bus_arrivals(saved_buses[selected_bus])
             
-            for bus in all_buses:
-                with st.container(border=True):
-                    col1, col2 = st.columns([0.25, 0.75])
-                    with col1: st.metric(label="Line", value=bus.get('line'))
-                    with col2:
-                        st.markdown(f"**To {bus.get('direction', 'Local Route')}**")
-                        st.caption(f"Estimated Arrival Time: **{bus.get('best_departure_estimate')}**")
+            if bus_data and 'departures' in bus_data:
+                st.markdown(f"### Live countdown for {selected_bus}")
+                all_buses = []
+                for line_no, lists in bus_data['departures'].items():
+                    all_buses.extend(lists)
+                all_buses = sorted(all_buses, key=lambda x: x.get('best_departure_estimate', '23:59'))
+                
+                for bus in all_buses:
+                    with st.container(border=True):
+                        col1, col2 = st.columns([0.25, 0.75])
+                        with col1: st.metric(label="Line", value=bus.get('line'))
+                        with col2:
+                            st.markdown(f"**To {bus.get('direction', 'Local Route')}**")
+                            st.caption(f"Estimated Arrival Time: **{bus.get('best_departure_estimate')}**")
+            else:
+                st.info("No upcoming real-time bus telemetry available for this stop.")
         else:
-            st.info("No upcoming real-time bus telemetry available for this stop.")
+            st.info("You haven't saved any bus stops yet. Use the 'Manage Watchlist' search to save your local loops.")
 
-# --- VIEW 4: MANAGE WATCHLIST ---
+# --- VIEW 4: MANAGE WATCHLIST (Dynamic API Search Engine) ---
 elif menu == "Manage Watchlist":
     st.subheader("Edit Watchlist Preferences")
     
     # 1. Manage London Lines
-    st.markdown("### London Underground/Overground")
+    st.markdown("### 🚇 London Lines")
     current_saved_lines = get_saved_routes(USER_ID)
     available_lines = sorted(list(line_status_map.keys()))
     selected_lines = st.multiselect("Select lines to track:", options=available_lines, default=current_saved_lines)
     
-    # 2. Manage Kent Trains
-    st.markdown("### Kent Rail Hubs")
-    kent_train_options = {
-        "Sevenoaks (SEV)": "SEV", "Ashford International (AFK)": "AFK", "Tunbridge Wells (TBW)": "TBW",
-        "Canterbury West (CBW)": "CBW", "Chatham (CTM)": "CTM", "Dartford (DFD)": "DFD", "Maidstone East (MDE)": "MDE"
-    }
-    current_saved_locs = get_saved_locations(USER_ID)
-    current_train_codes = [l['stop_id'] for l in current_saved_locs if l['transport_mode'] == "National Rail"]
-    default_trains = [k for k, v in kent_train_options.items() if v in current_train_codes]
-    selected_train_hubs = st.multiselect("Select stations to watch:", options=list(kent_train_options.keys()), default=default_trains)
-    
-    # 3. Manage Kent Buses
-    st.markdown("### Kent Bus Stops")
-    kent_bus_options = {
-        "Sevenoaks Bus Station (Bay A)": "2400A041320A",
-        "Dartford Home Gardens (Stop K)": "2400A001090A",
-        "Ashford International Bus Interchange": "2400A052040A"
-    }
-    current_bus_codes = [l['stop_id'] for l in current_saved_locs if l['transport_mode'] == "Bus"]
-    default_buses = [k for k, v in kent_bus_options.items() if v in current_bus_codes]
-    selected_bus_hubs = st.multiselect("Select bus stops to watch:", options=list(kent_bus_options.keys()), default=default_buses)
-    
-    if st.button("Save Dashboard Changes", use_container_width=True):
-        # Sync London Lines
+    if st.button("Save London Line Changes", use_container_width=True):
         for line in current_saved_lines:
             if line not in selected_lines: remove_saved_route(USER_ID, line)
         for line in selected_lines:
             if line not in current_saved_lines: add_saved_route(USER_ID, line)
-            
-        # Sync Kent Trains
-        chosen_train_codes = [kent_train_options[h] for h in selected_train_hubs]
-        for loc in current_saved_locs:
-            if loc['transport_mode'] == "National Rail" and loc['stop_id'] not in chosen_train_codes:
-                remove_saved_location(USER_ID, loc['stop_id'])
-        for h in selected_train_hubs:
-            code = kent_train_options[h]
-            name = h.split(" (")[0]
-            if code not in current_train_codes:
-                add_saved_location(USER_ID, name, code, "National Rail")
-                
-        # Sync Kent Buses
-        chosen_bus_codes = [kent_bus_options[h] for h in selected_bus_hubs]
-        for loc in current_saved_locs:
-            if loc['transport_mode'] == "Bus" and loc['stop_id'] not in chosen_bus_codes:
-                remove_saved_location(USER_ID, loc['stop_id'])
-        for h in selected_bus_hubs:
-            code = kent_bus_options[h]
-            if code not in current_bus_codes:
-                add_saved_location(USER_ID, h, code, "Bus")
-                
-        st.success("Watchlist preferences synced securely to Supabase backend database!")
+        st.success("London lines updated successfully!")
         st.rerun()
+
+    st.markdown("---")
+
+    # 2. Dynamic Kent Transit Hub Search Engine (Trains & Buses)
+    st.markdown("### 🔍 Search & Add Kent Hubs")
+    st.caption("Type any station name, street name, or town in Kent to find and track its live boards.")
+    
+    search_term = st.text_input("Enter search query (e.g., 'Sevenoaks', 'London Road', 'Dartford'):", value="")
+    
+    if search_term:
+        # A. National Rail Stations Search Preset Mapping
+        kent_train_options = {
+            "Sevenoaks": "SEV", "Ashford International": "AFK", "Tunbridge Wells": "TBW",
+            "Canterbury West": "CBW", "Chatham": "CTM", "Dartford": "DFD", "Maidstone East": "MDE"
+        }
+        
+        # Filter trains locally by search term
+        matched_trains = {k: v for k, v in kent_train_options.items() if search_term.lower() in k.lower()}
+        
+        if matched_trains:
+            st.markdown("**Matched Train Stations:**")
+            for name, crs in matched_trains.items():
+                col1, col2 = st.columns([0.7, 0.3])
+                with col1: st.markdown(f"🚉 **{name}** ({crs})")
+                with col2:
+                    if st.button("Add Station", key=f"add_train_{crs}", use_container_width=True):
+                        add_saved_location(USER_ID, name, crs, "National Rail")
+                        st.success(f"Added {name} to Watchlist!")
+                        st.rerun()
+
+        # B. Live API Bus Stop Endpoint Fetching
+        with st.spinner("Searching nationwide bus stops via API..."):
+            found_bus_stops = search_uk_bus_stops(search_term)
+            
+        if found_bus_stops:
+            st.markdown("**Matched Regional Bus Stops:**")
+            for stop in found_bus_stops[:8]:  # Limit top 8 matches for mobile view clarity
+                stop_name = stop.get('name', 'Unknown Stop')
+                indicator = stop.get('indicator', '')  # e.g., "Stop A" or "opp"
+                description = f"{stop_name} ({indicator})" if indicator else stop_name
+                atco_code = stop.get('atcocode')
+                locality = stop.get('locality', 'Kent')
+                
+                col1, col2 = st.columns([0.7, 0.3])
+                with col1: 
+                    st.markdown(f"🚌 **{description}**")
+                    st.caption(f"Locality: {locality} | Code: {atco_code}")
+                with col2:
+                    if st.button("Add Bus", key=f"add_bus_{atco_code}", use_container_width=True):
+                        add_saved_location(USER_ID, description, atco_code, "Bus")
+                        st.success(f"Saved {stop_name} to your Watchlist!")
+                        st.rerun()
+        
+        if not matched_trains and not found_bus_stops:
+            st.info("No matching transit hubs found. Try refining your spelling.")
+
+    st.markdown("---")
+
+    # 3. View Current Saved Hubs & Allow Deletions
+    st.markdown("### 🗑️ Current Saved Hubs")
+    current_saved_locs = get_saved_locations(USER_ID)
+    
+    if current_saved_locs:
+        for loc in current_saved_locs:
+            col1, col2 = st.columns([0.7, 0.3])
+            with col1:
+                icon = "🚉" if loc['transport_mode'] == "National Rail" else "🚌"
+                st.markdown(f"{icon} **{loc['location_name']}**")
+                st.caption(f"Type: {loc['transport_mode']} | Code: {loc['stop_id']}")
+            with col2:
+                if st.button("Remove", key=f"del_{loc['stop_id']}", use_container_width=True):
+                    remove_saved_location(USER_ID, loc['stop_id'])
+                    st.toast(f"Removed {loc['location_name']}")
+                    st.rerun()
+    else:
+        st.caption("You are not tracking any Kent stations or bus loops currently.")
