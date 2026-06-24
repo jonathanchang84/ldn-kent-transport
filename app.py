@@ -231,7 +231,7 @@ if menu == "Watchlist":
             st.markdown("#### Kent Train Stations")
             for loc in train_hubs:
                 with st.container(border=True):
-                    st.markdown(f"🚉 **{loc['location_name']} Departures**")
+                    st.markdown(f"痕 **{loc['location_name']} Departures**")
                     board = get_national_rail_board(loc['stop_id'])
                     if board and board.get('trainServices'):
                         for train in board['trainServices'][:3]:
@@ -253,7 +253,7 @@ if menu == "Watchlist":
                             st.caption(f"**{bus.get('line')}** to {bus.get('direction')} — **{bus.get('best_departure_estimate')}**")
                     else: st.caption("Live tracker unavailable.")
 
-# --- VIEW 2: ROUTE PLANNER ---
+# --- VIEW 2: ROUTE PLANNER (FIXED BUTTON STATE MIGRATION) ---
 elif menu == "Route Planner":
     st.subheader("📍 Multi-Modal Route Planner")
     
@@ -264,36 +264,49 @@ elif menu == "Route Planner":
     with col1: start_point = st.text_input("Start Location:", value=start_val)
     with col2: end_point = st.text_input("Destination:", value=end_val)
     
+    # Use session state to decouple calculation rendering from buttons
+    if "active_journey" not in st.session_state:
+        st.session_state.active_journey = None
+        st.session_state.last_start = ""
+        st.session_state.last_end = ""
+
     if st.button("Calculate Itinerary", use_container_width=True):
         if start_point and end_point:
             st.session_state.planned_start = start_point
             st.session_state.planned_end = end_point
-            
             with st.spinner("Plotting transport vectors..."):
-                journey_data = plan_journey(start_point, end_point)
-                
-            if journey_data and 'journeys' in journey_data:
-                q_start = urllib.parse.quote(start_point)
-                fallback_map = f"https://maps.google.com/maps?q={q_start}&output=embed"
-                st.components.v1.iframe(fallback_map, height=220, scrolling=False)
-                
-                with st.expander("💾 Save this trip connection"):
-                    alias_input = st.text_input("Name route:", value="Daily Commute")
-                    if st.button("Save to Dashboard", use_container_width=True):
-                        add_saved_journey(USER_ID, start_point, end_point, alias_input)
-                        st.success("Trip added to Watchlist dashboard!")
-                        st.rerun()
-                
-                for idx, journey in enumerate(journey_data['journeys'][:2]):
-                    with st.container(border=True):
-                        st.markdown(f"**Alternative {idx+1} ({journey.get('duration')} mins)**")
-                        for leg in journey.get('legs', []):
-                            st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
-                            for d in leg.get('disruptions', []):
-                                if is_disruption_within_window(d):
-                                    st.error(f"🚨 **Timeline Issue Flag:** {d.get('description')}")
-            else:
-                st.warning("Could not map those transit vectors cleanly. Verify entries.")
+                st.session_state.active_journey = plan_journey(start_point, end_point)
+                st.session_state.last_start = start_point
+                st.session_state.last_end = end_point
+
+    # Render results smoothly outside the button block check
+    if st.session_state.active_journey and st.session_state.last_start == start_point and st.session_state.last_end == end_point:
+        journey_data = st.session_state.active_journey
+        
+        if journey_data and 'journeys' in journey_data:
+            q_start = urllib.parse.quote(start_point)
+            fallback_map = f"https://maps.google.com/maps?q={q_start}&output=embed"
+            st.components.v1.iframe(fallback_map, height=220, scrolling=False)
+            
+            with st.expander("💾 Save this trip connection", expanded=True):
+                alias_input = st.text_input("Name route:", value="Daily Commute")
+                if st.button("Confirm & Save to Watchlist", use_container_width=True):
+                    add_saved_journey(USER_ID, start_point, end_point, alias_input)
+                    st.toast("Trip added to Watchlist dashboard!")
+                    # Clear session calculation layout flags to force index redirection lookups
+                    st.session_state.active_journey = None
+                    st.rerun()
+            
+            for idx, journey in enumerate(journey_data['journeys'][:2]):
+                with st.container(border=True):
+                    st.markdown(f"**Alternative {idx+1} ({journey.get('duration')} mins)**")
+                    for leg in journey.get('legs', []):
+                        st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
+                        for d in leg.get('disruptions', []):
+                            if is_disruption_within_window(d):
+                                st.error(f"🚨 **Timeline Issue Flag:** {d.get('description')}")
+        else:
+            st.warning("Could not map those transit vectors cleanly. Verify entries.")
 
 # --- VIEW 3: KENT LIVE HUBS ---
 elif menu == "Kent Live Hubs":
