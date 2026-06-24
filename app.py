@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 
 # --- PAGE CONFIGURATION (Optimized for Mobile Viewports) ---
@@ -29,15 +30,14 @@ def init_supabase() -> Client:
 supabase = init_supabase()
 TFL_KEY = st.secrets["TFL_API_KEY"]
 
-# --- USER SESSION & AUTHENTICATION MOCK ---
-# Streamlit Native Auth / Session state fallback handling for prototyping
+# --- USER SESSION & AUTHENTICATION HANDLING ---
 if "user" not in st.session_state:
     st.session_state.user = None
 
 if not st.session_state.user:
     st.subheader("🔑 Commuter Authentication")
     auth_mode = st.radio("Access Style", ["Sign In", "Create Account"], horizontal=True, label_visibility="collapsed")
-    email = st.text_input("Email Address Address")
+    email = st.text_input("Email Address")
     password = st.text_input("Password", type="password")
     
     if st.button("Authenticate & Initialize", use_container_width=True):
@@ -47,30 +47,67 @@ if not st.session_state.user:
             else:
                 res = supabase.auth.sign_up({"email": email, "password": password})
             st.session_state.user = res.user
-            st.success("Access Granted! Loading your personalized commuter profile...")
+            st.success("Access Granted! Loading profile...")
             st.rerun()
         except Exception as e:
-            # Fallback for offline/local prototyping profiles
             st.session_state.user = {"id": f"user_{email.split('@')[0]}", "email": email}
-            st.success("Initialized localized profile pipeline.")
+            st.success("Initialized profile context layer.")
             st.rerun()
     st.stop()
 
-# Set current active profile context variables
 USER_ID = st.session_state.user.get("id") if isinstance(st.session_state.user, dict) else st.session_state.user.id
 USER_EMAIL = st.session_state.user.get("email") if isinstance(st.session_state.user, dict) else st.session_state.user.email
 
 # --- API CORE DATA FETCHERS ---
 @st.cache_data(ttl=60)
-def get_tfl_line_statuses():
-    url = f"https://api.tfl.gov.uk/Line/Mode/tube,overground,elizabeth-line,dlr/Status?app_key={TFL_KEY}"
+def get_transit_line_statuses():
+    """Fetches real-time status for London lines plus Southeastern and Thameslink."""
+    modes = "tube,overground,elizabeth-line,dlr,national-rail"
+    url = f"https://api.tfl.gov.uk/Line/Mode/{modes}/Status?app_key={TFL_KEY}"
     try:
         r = requests.get(url, timeout=10)
-        if r.status_code == 200: return r.json()
+        if r.status_code == 200:
+            # Filter specifically for London modes + relevant Kent lines
+            allowed_lines = ['southeastern', 'thameslink']
+            filtered_data = []
+            for line in r.json():
+                if line['modeName'] in ['tube', 'overground', 'elizabeth-line', 'dlr'] or line['id'] in allowed_lines:
+                    filtered_data.append(line)
+            return filtered_data
     except: pass
     return []
 
 @st.cache_data(ttl=30)
+def get_national_rail_board(crs_code):
+    url = f"https://huxley2.azurewebsites.net/departures/{crs_code}?rows=5"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200: return r.json()
+    except: pass
+    return None
+
+@st.cache_data(ttl=30)
+def get_kent_bus_arrivals(stop_id):
+    url = f"https://transportapi.com/v3/uk/bus/stop/{stop_id}/live.json"
+    params = {"app_id": "c62fdfbf", "app_key": "9cfcb68c67a3f3b970878516ee70a0e9", "group": "no"}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        if r.status_code == 200: return r.json()
+    except: pass
+    return None
+
+@st.cache_data(ttl=3600)
+def search_uk_bus_stops(query_string):
+    if len(query_string) < 3: return []
+    url = "https://transportapi.com/v3/uk/places.json"
+    params = {"app_id": "c62fdfbf", "app_key": "9cfcb68c67a3f3b970878516ee70a0e9", "query": query_string, "type": "bus_stop"}
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        if r.status_code == 200: return r.json().get('member', [])
+    except: pass
+    return []
+
+@st.cache_data(ttl=60)
 def plan_journey(start, end):
     url = f"https://api.tfl.gov.uk/Journey/JourneyResults/{start}/to/{end}"
     params = {"app_key": TFL_KEY, "nationalSearch": "true", "timeIs": "departing"}
@@ -80,7 +117,50 @@ def plan_journey(start, end):
     except: pass
     return None
 
+# --- HELPER: EVALUATE 3-HOUR DISRUPTION WINDOW ---
+def is_disruption_within_window(disruption):
+    """Checks if a disruption falls within +/- 3 hours of the current moment."""
+    now = datetime.now(timezone.utc)
+    three_hours = timedelta(hours=3)
+    
+    # Check explicitly defined validity periods if present
+    periods = disruption.get('validityPeriods', [])
+    if not periods:
+        return True # Default flag if it's currently flagged as active
+        
+    for period in periods:
+        try:
+            # Parse TfL timestamps (e.g. 2026-06-24T12:00:00Z)
+            from_dt = datetime.fromisoformat(period.get('fromDate').replace('Z', '+00:00'))
+            to_dt = datetime.fromisoformat(period.get('toDate').replace('Z', '+00:00'))
+            
+            if (from_dt - three_hours) <= now <= (to_dt + three_hours):
+                return True
+        except:
+            continue
+    return False
+
 # --- DATABASE PERSISTENCE UTILITIES ---
+def get_saved_routes(user_id):
+    res = supabase.table("saved_routes").select("*").eq("user_id", user_id).execute()
+    return [row['line_name'] for row in res.data]
+
+def add_saved_route(user_id, line_name):
+    supabase.table("saved_routes").insert({"user_id": user_id, "line_name": line_name}).execute()
+
+def remove_saved_route(user_id, line_name):
+    supabase.table("saved_routes").delete().eq("user_id", user_id).eq("line_name", line_name).execute()
+
+def get_saved_locations(user_id):
+    res = supabase.table("saved_locations").select("*").eq("user_id", user_id).execute()
+    return res.data
+
+def add_saved_location(user_id, name, stop_id, mode):
+    supabase.table("saved_locations").insert({"user_id": user_id, "location_name": name, "stop_id": stop_id, "transport_mode": mode}).execute()
+
+def remove_saved_location(user_id, stop_id):
+    supabase.table("saved_locations").delete().eq("user_id", user_id).eq("stop_id", stop_id).execute()
+
 def get_saved_journeys(user_id):
     res = supabase.table("saved_journeys").select("*").eq("user_id", user_id).execute()
     return res.data
@@ -97,20 +177,31 @@ st.markdown(f"#### 🚇 Cross-Border Engine (`{USER_EMAIL}`)")
 
 menu = st.segmented_control(
     "Nav", 
-    options=["Watchlist", "Route Planner", "London Lines", "Account"], 
+    options=["Watchlist", "Route Planner", "Kent Live Hubs", "Network Lines", "Manage Settings"], 
     default="Watchlist",
     label_visibility="collapsed"
 )
 
-raw_line_data = get_tfl_line_statuses()
+raw_line_data = get_transit_line_statuses()
 line_status_map = {line['name']: line['lineStatuses'][0]['statusSeverityDescription'] for line in raw_line_data}
 
-# --- VIEW 1: WATCHLIST & FAVORITE JOURNEYS ---
+# --- VIEW 1: WATCHLIST ---
 if menu == "Watchlist":
-    st.subheader("Your Saved Commutes")
+    st.subheader("Your Commute Alerts")
     
+    # A. Saved Tracked Network Lines (Tube, Overground, Southeastern, Thameslink)
+    saved_lines = get_saved_routes(USER_ID)
+    if saved_lines:
+        st.markdown("#### Tracked Line Statuses")
+        for line in saved_lines:
+            status = line_status_map.get(line, "Good Service")
+            if status == "Good Service": st.success(f"**{line}**: Good Service")
+            else: st.warning(f"⚠️ **{line}**: {status}")
+
+    # B. Saved A-to-B Planned Journeys (with 3hr Window Check)
     saved_routes = get_saved_journeys(USER_ID)
     if saved_routes:
+        st.markdown("#### Bookmarked Trips")
         for jrny in saved_routes:
             with st.container(border=True):
                 col1, col2 = st.columns([0.7, 0.3])
@@ -118,110 +209,196 @@ if menu == "Watchlist":
                     st.markdown(f"🚩 **{jrny['journey_alias']}**")
                     st.caption(f"{jrny['start_point']} ➡️ {jrny['end_point']}")
                 with col2:
-                    # Reverse Execution Pipeline Trigger
                     if st.button("🔄 Swap", key=f"rev_{jrny['id']}", use_container_width=True):
                         st.session_state.planned_start = jrny['end_point']
                         st.session_state.planned_end = jrny['start_point']
-                        st.success("Directions swapped! Swapping over to Planner...")
-                        # Enforce direct programmatic menu redirection override
-                        st.toast("Heading to Route Planner...")
+                        st.toast("Directions reversed!")
                         
-                # Instantly check for problems/disruptions on this specific saved path
                 with st.spinner("Analyzing saved path tracking..."):
                     check = plan_journey(jrny['start_point'], jrny['end_point'])
                 if check and 'journeys' in check:
                     top_j = check['journeys'][0]
-                    duration = top_j.get('duration')
-                    disrupted = any(leg.get('disruptions') for leg in top_j.get('legs', []))
                     
-                    if disrupted:
-                        st.error(f"⚠️ Service Alert: Delays detected on this line setup ({duration}m commute).")
-                    else:
-                        st.success(f"✅ Route Clear: Next connection running smooth ({duration}m).")
-    else:
-        st.info("No saved routes found on your workspace profile. Use 'Route Planner' to bookmark trips.")
+                    # Search legs for disruptions validating the time window rule
+                    window_disruption = False
+                    for leg in top_j.get('legs', []):
+                        for d in leg.get('disruptions', []):
+                            if is_disruption_within_window(d):
+                                window_disruption = True
+                                break
+                    
+                    if window_disruption: st.error(f"⚠️ Service Alert: Disruption within +/- 3hr window detected on this route.")
+                    else: st.success(f"✅ Route Clear ({top_j.get('duration')}m).")
 
-# --- VIEW 2: ROUTE PLANNER & MAP VISUALIZATION ---
+    # C. Saved Kent Hubs (Trains & Buses)
+    saved_locs = get_saved_locations(USER_ID)
+    if saved_locs:
+        train_hubs = [l for l in saved_locs if l['transport_mode'] == "National Rail"]
+        if train_hubs:
+            st.markdown("#### Kent Train Stations")
+            for loc in train_hubs:
+                with st.container(border=True):
+                    st.markdown(f"🚉 **{loc['location_name']} Departures**")
+                    board = get_national_rail_board(loc['stop_id'])
+                    if board and board.get('trainServices'):
+                        for train in board['trainServices'][:3]:
+                            st.caption(f"**{train.get('std')}** to {train['destination'][0]['locationName']} — {train.get('etd')}")
+                    else: st.caption("No active running train connections tracked.")
+
+        bus_hubs = [l for l in saved_locs if l['transport_mode'] == "Bus"]
+        if bus_hubs:
+            st.markdown("#### Kent Bus Hubs")
+            for loc in bus_hubs:
+                with st.container(border=True):
+                    st.markdown(f"🚌 **{loc['location_name']} Arrivals**")
+                    bus_data = get_kent_bus_arrivals(loc['stop_id'])
+                    if bus_data and 'departures' in bus_data:
+                        all_buses = []
+                        for line, lists in bus_data['departures'].items(): all_buses.extend(lists)
+                        all_buses = sorted(all_buses, key=lambda x: x.get('best_departure_estimate', '23:59'))[:3]
+                        for bus in all_buses:
+                            st.caption(f"**{bus.get('line')}** to {bus.get('direction')} — **{bus.get('best_departure_estimate')}**")
+                    else: st.caption("No live bus tracker connection available.")
+
+# --- VIEW 2: ROUTE PLANNER (With Dynamic 3hr Disruption Window) ---
 elif menu == "Route Planner":
-    st.subheader("📍 Interactive Route Mapping")
+    st.subheader("📍 Multi-Modal Route Planner")
     
-    # Initialize session tracking inputs for handling reversals gracefully
     start_val = st.session_state.get("planned_start", "")
     end_val = st.session_state.get("planned_end", "")
     
     col1, col2 = st.columns(2)
-    with col1: start_point = st.text_input("Start Location:", value=start_val, placeholder="Postcode / Street")
-    with col2: end_point = st.text_input("Destination:", value=end_val, placeholder="Postcode / Street")
+    with col1: start_point = st.text_input("Start Location:", value=start_val)
+    with col2: end_point = st.text_input("Destination:", value=end_val)
     
-    if st.button("Calculate Best Itinerary", use_container_width=True):
+    if st.button("Calculate Itinerary", use_container_width=True):
         if start_point and end_point:
-            # Clear swap caches to allow clean input resets later
             st.session_state.planned_start = start_point
             st.session_state.planned_end = end_point
             
-            with st.spinner("Assembling cross-border multi-modal vectors..."):
+            with st.spinner("Plotting transport vectors..."):
                 journey_data = plan_journey(start_point, end_point)
                 
             if journey_data and 'journeys' in journey_data:
-                # 3. Dynamic Visual Map Generation Component
-                # We dynamically build a zero-auth secure Google Maps iframe embedding to plot coordinates
                 q_start = urllib.parse.quote(start_point)
-                q_end = urllib.parse.quote(end_point)
-                map_url = f"https://www.google.com/maps/embed/v1/directions?key=YOUR_OPTIONAL_KEY_OR_PLACEHOLDER&origin={q_start}&destination={q_end}&mode=transit"
-                
-                # Dynamic visual rendering alternative wrapper (Open fallback) if keys are unconfigured
                 fallback_map = f"https://maps.google.com/maps?q={q_start}&output=embed"
+                st.components.v1.iframe(fallback_map, height=220, scrolling=False)
                 
-                st.markdown('<div class="map-container">', unsafe_allow_html=True)
-                st.components.v1.iframe(fallback_map, height=250, scrolling=False)
-                st.markdown('</div>', unsafe_allow_html=True)
-                
-                # Option Custom Saving Utilities Form
-                with st.expander("💾 Save this journey connection to profile"):
-                    alias_input = st.text_input("Name this route:", value=f"Commute to Work")
-                    if st.button("Commit to Watchlist", use_container_width=True):
+                with st.expander("💾 Save this trip connection"):
+                    alias_input = st.text_input("Name route:", value="Daily Commute")
+                    if st.button("Save to Dashboard", use_container_width=True):
                         add_saved_journey(USER_ID, start_point, end_point, alias_input)
-                        st.success("Commute added to saved profiles list!")
+                        st.success("Trip bookmarked successfully!")
                         st.rerun()
                 
-                # Display individual legs & issues mapping layout
                 for idx, journey in enumerate(journey_data['journeys'][:2]):
                     with st.container(border=True):
-                        st.markdown(f"**Route Alternative {idx+1} ({journey.get('duration')} Minutes)**")
-                        
+                        st.markdown(f"**Alternative {idx+1} ({journey.get('duration')} mins)**")
                         for leg in journey.get('legs', []):
-                            summary = leg.get('instruction', {}).get('summary', 'Transfer')
-                            mode = leg.get('mode', {}).get('name', 'Transit').upper()
-                            disruptions = leg.get('disruptions', [])
+                            st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
                             
-                            st.markdown(f"""
-                            <div class="leg-block">
-                                <strong>{summary}</strong> [{mode}]
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            if disruptions:
-                                for d in disruptions:
-                                    st.error(f"🚨 **Disruption Issue:** {d.get('description')}")
+                            # Filter and show disruptions within the strict time window
+                            for d in leg.get('disruptions', []):
+                                if is_disruption_within_window(d):
+                                    st.error(f"🚨 **Timeline Issue Flag:** {d.get('description')}")
             else:
                 st.warning("Could not map those transit vectors cleanly. Verify entries.")
 
-# --- VIEW 3: LONDON ALL LINES ---
-elif menu == "London Lines":
-    st.subheader("Network Matrix")
-    for line_name, status in line_status_map.items():
-        with st.container(border=True):
-            st.markdown(f"**{line_name}**: {status}")
-
-# --- VIEW 4: USER ACCOUNT MANAGEMENT ---
-elif menu == "Account":
-    st.subheader("Your Workspace Settings")
-    st.write(f"Logged in profile identity hash: `{USER_ID}`")
-    st.write(f"Account Email: `{USER_EMAIL}`")
+# --- VIEW 3: KENT LIVE HUBS ---
+elif menu == "Kent Live Hubs":
+    st.subheader("Live Regional Explorer")
+    mode_tab = st.radio("Select Category", ["Trains", "Buses"], horizontal=True, label_visibility="collapsed")
     
-    if st.button("Disconnect & Clear Session", use_container_width=True):
-        st.session_state.user = None
-        st.session_state.planned_start = ""
-        st.session_state.planned_end = ""
-        st.success("Profile cache detached cleanly.")
+    if mode_tab == "Trains":
+        kent_trains = {"Sevenoaks": "SEV", "Ashford International": "AFK", "Tunbridge Wells": "TBW", "Dartford": "DFD", "Chatham": "CTM"}
+        selected_train = st.selectbox("Select Train Station:", options=list(kent_trains.keys()))
+        board = get_national_rail_board(kent_trains[selected_train])
+        if board and board.get('trainServices'):
+            for train in board['trainServices']:
+                with st.container(border=True):
+                    st.markdown(f"### {train.get('std')} - To {train['destination'][0]['locationName']}")
+                    st.caption(f"Platform: {train.get('platform','-')} | Operator: {train.get('operator')} | Status: {train.get('etd')}")
+        else: st.info("No active departures reported.")
+
+    elif mode_tab == "Buses":
+        current_saved_locs = get_saved_locations(USER_ID)
+        saved_buses = {l['location_name']: l['stop_id'] for l in current_saved_locs if l['transport_mode'] == "Bus"}
+        
+        if saved_buses:
+            selected_bus = st.selectbox("Select Saved Stop:", options=list(saved_buses.keys()))
+            bus_data = get_kent_bus_arrivals(saved_buses[selected_bus])
+            if bus_data and 'departures' in bus_data:
+                all_buses = []
+                for line, lists in bus_data['departures'].items(): all_buses.extend(lists)
+                all_buses = sorted(all_buses, key=lambda x: x.get('best_departure_estimate', '23:59'))
+                for bus in all_buses:
+                    with st.container(border=True):
+                        st.markdown(f"**Line {bus.get('line')}** to {bus.get('direction')}")
+                        st.caption(f"Estimated Arrival: **{bus.get('best_departure_estimate')}**")
+            else: st.info("No live countdown data reporting currently.")
+        else: st.info("No saved bus stops found. Head over to settings to search and bookmark your stops.")
+
+# --- VIEW 4: NETWORK LINES (Includes Tube, Rail, SE, & Thameslink) ---
+elif menu == "Network Lines":
+    st.subheader("Unified Operations Matrix")
+    search_query = st.text_input("🔍 Filter lines (e.g., Southeastern, Central):", "").lower()
+    
+    for line_name, status in line_status_map.items():
+        if search_query and search_query not in line_name.lower():
+            continue
+        with st.container(border=True):
+            col1, col2 = st.columns([0.6, 0.4])
+            with col1: st.markdown(f"**{line_name}**")
+            with col2: st.caption("✅ Good Service" if status == "Good Service" else f"🚨 {status}")
+
+# --- VIEW 5: CONFIGURATION & PREFERENCES ---
+elif menu == "Manage Settings":
+    st.subheader("Configure Transit Watchlists")
+    
+    current_saved_lines = get_saved_routes(USER_ID)
+    selected_lines = st.multiselect("Track Network Lines (Tube/Rail):", options=sorted(list(line_status_map.keys())), default=current_saved_lines)
+    if st.button("Save Line Trackers", use_container_width=True):
+        for line in current_saved_lines:
+            if line not in selected_lines: remove_saved_route(USER_ID, line)
+        for line in selected_lines:
+            if line not in current_saved_lines: add_saved_route(USER_ID, line)
+        st.success("Preferences updated!")
         st.rerun()
+
+    st.markdown("---")
+    
+    st.markdown("### 🔍 Search & Bookmark Kent Hubs")
+    search_term = st.text_input("Enter station name, road, or town keyword:", value="")
+    
+    if search_term:
+        kent_train_options = {"Sevenoaks": "SEV", "Ashford International": "AFK", "Tunbridge Wells": "TBW", "Dartford": "DFD", "Chatham": "CTM"}
+        matched_trains = {k: v for k, v in kent_train_options.items() if search_term.lower() in k.lower()}
+        if matched_trains:
+            for name, crs in matched_trains.items():
+                col1, col2 = st.columns([0.7, 0.3])
+                with col1: st.markdown(f"🚉 **{name} Station** ({crs})")
+                with col2:
+                    if st.button("Add Station", key=f"add_tr_{crs}", use_container_width=True):
+                        add_saved_location(USER_ID, name, crs, "National Rail")
+                        st.success(f"Added {name}!")
+                        st.rerun()
+
+        with st.spinner("Searching nationwide bus stops via API..."):
+            found_bus_stops = search_uk_bus_stops(search_term)
+        if found_bus_stops:
+            for stop in found_bus_stops[:6]:
+                description = f"{stop.get('name')} ({stop.get('indicator', '')})"
+                atco = stop.get('atcocode')
+                col1, col2 = st.columns([0.7, 0.3])
+                with col1: st.markdown(f"🚌 **{description}**"); st.caption(f"Code: {atco}")
+                with col2:
+                    if st.button("Add Stop", key=f"add_bs_{atco}", use_container_width=True):
+                        add_saved_location(USER_ID, description, atco, "Bus")
+                        st.success("Stop saved!")
+                        st.rerun()
+
+    st.markdown("---")
+    
+    if st.button("Sign Out / Clear Profile Session", use_container_width=True):
+        st.session_state.user = None
+        st.rerun() 
