@@ -67,7 +67,6 @@ def get_transit_line_statuses():
     try:
         r = requests.get(url, timeout=10)
         if r.status_code == 200:
-            # Filter specifically for London modes + relevant Kent lines
             allowed_lines = ['southeastern', 'thameslink']
             filtered_data = []
             for line in r.json():
@@ -123,14 +122,12 @@ def is_disruption_within_window(disruption):
     now = datetime.now(timezone.utc)
     three_hours = timedelta(hours=3)
     
-    # Check explicitly defined validity periods if present
     periods = disruption.get('validityPeriods', [])
     if not periods:
-        return True # Default flag if it's currently flagged as active
+        return True
         
     for period in periods:
         try:
-            # Parse TfL timestamps (e.g. 2026-06-24T12:00:00Z)
             from_dt = datetime.fromisoformat(period.get('fromDate').replace('Z', '+00:00'))
             to_dt = datetime.fromisoformat(period.get('toDate').replace('Z', '+00:00'))
             
@@ -189,7 +186,7 @@ line_status_map = {line['name']: line['lineStatuses'][0]['statusSeverityDescript
 if menu == "Watchlist":
     st.subheader("Your Commute Alerts")
     
-    # A. Saved Tracked Network Lines (Tube, Overground, Southeastern, Thameslink)
+    # A. Tracked Line Statuses
     saved_lines = get_saved_routes(USER_ID)
     if saved_lines:
         st.markdown("#### Tracked Line Statuses")
@@ -198,11 +195,11 @@ if menu == "Watchlist":
             if status == "Good Service": st.success(f"**{line}**: Good Service")
             else: st.warning(f"⚠️ **{line}**: {status}")
 
-    # B. Saved A-to-B Planned Journeys (with 3hr Window Check)
-    saved_routes = get_saved_journeys(USER_ID)
-    if saved_routes:
+    # B. Saved A-to-B Planned Journeys (FIXED LOOKUP LOGIC)
+    saved_trips = get_saved_journeys(USER_ID)
+    if saved_trips:
         st.markdown("#### Bookmarked Trips")
-        for jrny in saved_routes:
+        for jrny in saved_trips:
             with st.container(border=True):
                 col1, col2 = st.columns([0.7, 0.3])
                 with col1:
@@ -213,13 +210,13 @@ if menu == "Watchlist":
                         st.session_state.planned_start = jrny['end_point']
                         st.session_state.planned_end = jrny['start_point']
                         st.toast("Directions reversed!")
+                        st.rerun()
                         
                 with st.spinner("Analyzing saved path tracking..."):
                     check = plan_journey(jrny['start_point'], jrny['end_point'])
                 if check and 'journeys' in check:
                     top_j = check['journeys'][0]
                     
-                    # Search legs for disruptions validating the time window rule
                     window_disruption = False
                     for leg in top_j.get('legs', []):
                         for d in leg.get('disruptions', []):
@@ -230,7 +227,7 @@ if menu == "Watchlist":
                     if window_disruption: st.error(f"⚠️ Service Alert: Disruption within +/- 3hr window detected on this route.")
                     else: st.success(f"✅ Route Clear ({top_j.get('duration')}m).")
 
-    # C. Saved Kent Hubs (Trains & Buses)
+    # C. Saved Kent Hubs
     saved_locs = get_saved_locations(USER_ID)
     if saved_locs:
         train_hubs = [l for l in saved_locs if l['transport_mode'] == "National Rail"]
@@ -260,7 +257,7 @@ if menu == "Watchlist":
                             st.caption(f"**{bus.get('line')}** to {bus.get('direction')} — **{bus.get('best_departure_estimate')}**")
                     else: st.caption("No live bus tracker connection available.")
 
-# --- VIEW 2: ROUTE PLANNER (With Dynamic 3hr Disruption Window) ---
+# --- VIEW 2: ROUTE PLANNER ---
 elif menu == "Route Planner":
     st.subheader("📍 Multi-Modal Route Planner")
     
@@ -296,8 +293,6 @@ elif menu == "Route Planner":
                         st.markdown(f"**Alternative {idx+1} ({journey.get('duration')} mins)**")
                         for leg in journey.get('legs', []):
                             st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
-                            
-                            # Filter and show disruptions within the strict time window
                             for d in leg.get('disruptions', []):
                                 if is_disruption_within_window(d):
                                     st.error(f"🚨 **Timeline Issue Flag:** {d.get('description')}")
@@ -338,10 +333,10 @@ elif menu == "Kent Live Hubs":
             else: st.info("No live countdown data reporting currently.")
         else: st.info("No saved bus stops found. Head over to settings to search and bookmark your stops.")
 
-# --- VIEW 4: NETWORK LINES (Includes Tube, Rail, SE, & Thameslink) ---
+# --- VIEW 4: NETWORK LINES ---
 elif menu == "Network Lines":
     st.subheader("Unified Operations Matrix")
-    search_query = st.text_input("🔍 Filter lines (e.g., Southeastern, Central):", "").lower()
+    search_query = st.text_input("🔍 Filter lines:", "").lower()
     
     for line_name, status in line_status_map.items():
         if search_query and search_query not in line_name.lower():
@@ -401,4 +396,4 @@ elif menu == "Manage Settings":
     
     if st.button("Sign Out / Clear Profile Session", use_container_width=True):
         st.session_state.user = None
-        st.rerun() 
+        st.rerun()
