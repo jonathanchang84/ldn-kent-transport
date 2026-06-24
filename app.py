@@ -19,6 +19,8 @@ st.markdown("""
     .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 10px; }
     .leg-block { border-left: 4px solid #1E3A8A; padding-left: 10px; margin-bottom: 10px; }
     .map-container { border-radius: 8px; overflow: hidden; margin-bottom: 15px; }
+    /* Style trip title to look like a clickable link */
+    .trip-link { color: #1E3A8A; text-decoration: underline; cursor: pointer; font-weight: bold; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -57,6 +59,16 @@ if not st.session_state.user:
 
 USER_ID = st.session_state.user.get("id") if isinstance(st.session_state.user, dict) else st.session_state.user.id
 USER_EMAIL = st.session_state.user.get("email") if isinstance(st.session_state.user, dict) else st.session_state.user.email
+
+# --- Initialize Global App Navigation State Variables ---
+if "current_tab" not in st.session_state:
+    st.session_state.current_tab = "Watchlist"
+if "planned_start" not in st.session_state:
+    st.session_state.planned_start = ""
+if "planned_end" not in st.session_state:
+    st.session_state.planned_end = ""
+if "trigger_search" not in st.session_state:
+    st.session_state.trigger_search = False
 
 # --- API CORE DATA FETCHERS ---
 @st.cache_data(ttl=60)
@@ -163,18 +175,21 @@ def remove_saved_journey(journey_id):
 # --- APPLICATION UI LAYOUT ---
 st.markdown(f"#### 🚇 Cross-Border Engine (`{USER_EMAIL}`)")
 
+# Force menu option select state sync tracking
 menu = st.segmented_control(
     "Nav", 
     options=["Watchlist", "Route Planner", "Kent Live Hubs", "Network Lines", "Manage Settings"], 
-    default="Watchlist",
+    key="navigation_segmented_control",
+    default=st.session_state.current_tab,
     label_visibility="collapsed"
 )
+st.session_state.current_tab = menu
 
 raw_line_data = get_transit_line_statuses()
 line_status_map = {line['name']: line['lineStatuses'][0]['statusSeverityDescription'] for line in raw_line_data}
 
 # --- VIEW 1: WATCHLIST ---
-if menu == "Watchlist":
+if st.session_state.current_tab == "Watchlist":
     st.subheader("Your Commute Dashboard")
     
     # A. Tracked Network Line Health Flags
@@ -190,16 +205,26 @@ if menu == "Watchlist":
     saved_trips = get_saved_journeys(USER_ID)
     if saved_trips:
         st.markdown("#### Bookmarked Trips")
+        st.caption("💡 Click on a route's name to view live details and step-by-step options.")
+        
         for jrny in saved_trips:
             with st.container(border=True):
                 col1, col2, col3 = st.columns([0.5, 0.25, 0.25])
                 with col1:
-                    st.markdown(f"🚩 **{jrny['journey_alias']}**")
+                    # Make the title a button that switches views and queries immediately
+                    if st.button(f"🚩 {jrny['journey_alias']}", key=f"inspect_{jrny['id']}", use_container_width=True):
+                        st.session_state.planned_start = jrny['start_point']
+                        st.session_state.planned_end = jrny['end_point']
+                        st.session_state.current_tab = "Route Planner"
+                        st.session_state.trigger_search = True
+                        st.rerun()
                     st.caption(f"{jrny['start_point']} ➡️ {jrny['end_point']}")
                 with col2:
                     if st.button("🔄 Swap", key=f"rev_{jrny['id']}", use_container_width=True):
                         st.session_state.planned_start = jrny['end_point']
                         st.session_state.planned_end = jrny['start_point']
+                        st.session_state.current_tab = "Route Planner"
+                        st.session_state.trigger_search = True
                         st.toast("Directions reversed!")
                         st.rerun()
                 with col3:
@@ -231,7 +256,7 @@ if menu == "Watchlist":
             st.markdown("#### Kent Train Stations")
             for loc in train_hubs:
                 with st.container(border=True):
-                    st.markdown(f"痕 **{loc['location_name']} Departures**")
+                    st.markdown(f"🚉 **{loc['location_name']} Departures**")
                     board = get_national_rail_board(loc['stop_id'])
                     if board and board.get('trainServices'):
                         for train in board['trainServices'][:3]:
@@ -253,24 +278,23 @@ if menu == "Watchlist":
                             st.caption(f"**{bus.get('line')}** to {bus.get('direction')} — **{bus.get('best_departure_estimate')}**")
                     else: st.caption("Live tracker unavailable.")
 
-# --- VIEW 2: ROUTE PLANNER (FIXED BUTTON STATE MIGRATION) ---
-elif menu == "Route Planner":
+# --- VIEW 2: ROUTE PLANNER (SUPPORTING EXTERNAL EVENT LINKS) ---
+elif st.session_state.current_tab == "Route Planner":
     st.subheader("📍 Multi-Modal Route Planner")
     
-    start_val = st.session_state.get("planned_start", "")
-    end_val = st.session_state.get("planned_end", "")
-    
     col1, col2 = st.columns(2)
-    with col1: start_point = st.text_input("Start Location:", value=start_val)
-    with col2: end_point = st.text_input("Destination:", value=end_val)
+    with col1: start_point = st.text_input("Start Location:", value=st.session_state.planned_start)
+    with col2: end_point = st.text_input("Destination:", value=st.session_state.planned_end)
     
-    # Use session state to decouple calculation rendering from buttons
     if "active_journey" not in st.session_state:
         st.session_state.active_journey = None
         st.session_state.last_start = ""
         st.session_state.last_end = ""
 
-    if st.button("Calculate Itinerary", use_container_width=True):
+    # Force action if redirected from Watchlist click event
+    calculate_clicked = st.button("Calculate Itinerary", use_container_width=True)
+    if calculate_clicked or st.session_state.trigger_search:
+        st.session_state.trigger_search = False  # Reset flag immediately
         if start_point and end_point:
             st.session_state.planned_start = start_point
             st.session_state.planned_end = end_point
@@ -279,7 +303,7 @@ elif menu == "Route Planner":
                 st.session_state.last_start = start_point
                 st.session_state.last_end = end_point
 
-    # Render results smoothly outside the button block check
+    # Render calculations smoothly
     if st.session_state.active_journey and st.session_state.last_start == start_point and st.session_state.last_end == end_point:
         journey_data = st.session_state.active_journey
         
@@ -288,20 +312,29 @@ elif menu == "Route Planner":
             fallback_map = f"https://maps.google.com/maps?q={q_start}&output=embed"
             st.components.v1.iframe(fallback_map, height=220, scrolling=False)
             
-            with st.expander("💾 Save this trip connection", expanded=True):
+            with st.expander("💾 Save this trip connection"):
                 alias_input = st.text_input("Name route:", value="Daily Commute")
                 if st.button("Confirm & Save to Watchlist", use_container_width=True):
                     add_saved_journey(USER_ID, start_point, end_point, alias_input)
                     st.toast("Trip added to Watchlist dashboard!")
-                    # Clear session calculation layout flags to force index redirection lookups
                     st.session_state.active_journey = None
+                    st.session_state.current_tab = "Watchlist"
                     st.rerun()
             
             for idx, journey in enumerate(journey_data['journeys'][:2]):
                 with st.container(border=True):
                     st.markdown(f"**Alternative {idx+1} ({journey.get('duration')} mins)**")
+                    
+                    # Live breakdown instructions rendering loop
                     for leg in journey.get('legs', []):
                         st.markdown(f'<div class="leg-block"><strong>{leg.get("instruction", {}).get("summary")}</strong></div>', unsafe_allow_html=True)
+                        
+                        # Nested detailed step-by-step instruction blocks
+                        if 'path' in leg and 'stopPoints' in leg['path'] and leg['path']['stopPoints']:
+                            with st.expander(f"📋 View stops ({len(leg['path']['stopPoints'])} calling points)"):
+                                for pt in leg['path']['stopPoints']:
+                                    st.caption(f"・ {pt.get('name')}")
+                        
                         for d in leg.get('disruptions', []):
                             if is_disruption_within_window(d):
                                 st.error(f"🚨 **Timeline Issue Flag:** {d.get('description')}")
@@ -309,7 +342,7 @@ elif menu == "Route Planner":
             st.warning("Could not map those transit vectors cleanly. Verify entries.")
 
 # --- VIEW 3: KENT LIVE HUBS ---
-elif menu == "Kent Live Hubs":
+elif st.session_state.current_tab == "Kent Live Hubs":
     st.subheader("Live Regional Explorer")
     mode_tab = st.radio("Select Category", ["Trains", "Buses"], horizontal=True, label_visibility="collapsed")
     
@@ -343,7 +376,7 @@ elif menu == "Kent Live Hubs":
         else: st.info("No saved bus stops found. Head over to settings to search and bookmark your stops.")
 
 # --- VIEW 4: NETWORK LINES ---
-elif menu == "Network Lines":
+elif st.session_state.current_tab == "Network Lines":
     st.subheader("Unified Operations Matrix")
     search_query = st.text_input("🔍 Filter lines:", "").lower()
     
@@ -356,7 +389,7 @@ elif menu == "Network Lines":
             with col2: st.caption("✅ Good Service" if status == "Good Service" else f"🚨 {status}")
 
 # --- VIEW 5: CONFIGURATION & PREFERENCES ---
-elif menu == "Manage Settings":
+elif st.session_state.current_tab == "Manage Settings":
     st.subheader("Configure Transit Watchlists")
     
     current_saved_lines = get_saved_routes(USER_ID)
